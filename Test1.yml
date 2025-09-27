@@ -1,0 +1,179 @@
+---
+- name: Full Resource-Usage Test Init + Swarm → Kubernetes
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    # Laufzeiten (Sekunden)
+    warmup_duration: 60
+    main_duration:   180
+    idle_duration:   60
+
+    # Lastprofile für wrk2
+    warmup_rps: 50
+    main_rps:   100
+    wrk_threads: 2
+    wrk_conns:   50
+
+    # Ergebnis-Ablegung
+    results_root: results
+
+    # Prometheus (lokal auf Control-Host)
+    prometheus_cfg_src:  templates/prometheus.yml.j2
+    prometheus_cfg_dest: /etc/prometheus/prometheus.yml
+    prometheus_data_dir: /opt/prometheus
+
+    # Orchestratoren in der Testreihenfolge
+    orchestrators: [ "swarm", "k8s" ]
+
+    # wrk2 Binary-Pfad (wird gebaut, falls nicht vorhanden)
+    wrk2_bin: /usr/local/bin/wrk2
+
+  tasks:
+    # Eindeutigen Zeitstempel erzeugen (z. B. 20250912_010735)
+    - name: Timestamp setzen
+      set_fact:
+        run_timestamp: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
+
+    # Nächste laufende Ergebnisnummer bestimmen (result_N_*)
+    - name: Nächste Ergebnis-Nummer ermitteln (hochzählend)
+      shell: |
+        set -euo pipefail
+        shopt -s nullglob
+        n=0
+        for d in {{ results_root }}/result_*_*; do
+          b="$(basename "$d")"
+          i="${b#result_}"; i="${i%%_*}"
+          [[ "$i" =~ ^[0-9]+$ ]] && (( i>n )) && n=$i
+        done
+        echo $((n+1))
+      args: { executable: /bin/bash }
+      register: next_run_number
+      changed_when: false
+
+    # IDs und Basispfade ableiten
+    - name: Globale Ergebnis-IDs setzen
+      set_fact:
+        run_number: "{{ next_run_number.stdout | int }}"
+        run_id: "result_{{ next_run_number.stdout | int }}_{{ run_timestamp }}"
+
+    - name: Ergebnis-Basisverzeichnis setzen
+      set_fact:
+        base_result_dir: "{{ results_root }}/{{ run_id }}"
+
+    # Ergebnisverzeichnisse anlegen
+    - name: Ergebnis-Verzeichnisse anlegen
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ results_root }}"
+        - "{{ base_result_dir }}"
+        - "{{ base_result_dir }}/swarm"
+        - "{{ base_result_dir }}/k8s"
+
+    # sysstat auf Cluster-Nodes (optional für lokale Checks)
+    - name: sysstat auf allen Cluster-Nodes installieren
+      package:
+        name: sysstat
+        state: present
+      become: yes
+      delegate_to: "{{ item }}"
+      loop: "{{ (groups.get('swarm_nodes', []) + groups.get('k8s_nodes', [])) }}"
+      loop_control: { loop_var: item }
+
+    # Build-Abhängigkeiten für wrk2 auf dem Control-Host
+    - name: Build-Deps für wrk2 (Control-Host)
+      package:
+        name:
+          - git
+          - build-essential
+        state: present
+      become: yes
+
+    # Prüfen, ob wrk2 vorhanden ist
+    - name: Prüfen, ob wrk2 vorhanden ist
+      stat:
+        path: "{{ wrk2_bin }}"
+      register: wrk2_stat
+
+    # wrk2 nur bei Bedarf clonen und bauen
+    - name: wrk2 clonen & bauen (falls nötig)
+      when: not wrk2_stat.stat.exists
+      block:
+        - git:
+            repo: https://github.com/giltene/wrk2.git
+            dest: /tmp/wrk2
+            version: master
+        - name: wrk2 bauen und installieren
+          shell: |
+            set -e
+            cd /tmp/wrk2
+            make
+            install -m 0755 wrk "{{ wrk2_bin }}"
+          args: { executable: /bin/bash }
+          become: yes
+
+    # Prometheus lokal bereitstellen (Config via Template, Datenverzeichnis persistent)
+    - name: Prometheus Verzeichnisse anlegen
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ prometheus_data_dir }}"
+        - "{{ prometheus_cfg_dest | dirname }}"
+      become: yes
+
+    - name: Prometheus Config rendern
+      template:
+        src:  "{{ prometheus_cfg_src }}"
+        dest: "{{ prometheus_cfg_dest }}"
+        mode: "0644"
+      become: yes
+
+    - name: Prometheus Container starten
+      community.docker.docker_container:
+        name: prometheus
+        image: prom/prometheus:latest
+        restart_policy: always
+        state: started
+        ports:
+          - "9090:9090"
+        command:
+          - "--config.file={{ prometheus_cfg_dest }}"
+          - "--storage.tsdb.path={{ prometheus_data_dir }}"
+        volumes:
+          - "{{ prometheus_cfg_dest }}:{{ prometheus_cfg_dest }}:ro"
+          - "{{ prometheus_data_dir }}:{{ prometheus_data_dir }}"
+      become: yes
+
+    # Lauf-Metadaten schreiben (nützlich für spätere Auswertung)
+    - name: Metadaten zum Lauf speichern
+      copy:
+        dest: "{{ base_result_dir }}/metadata.yml"
+        mode: "0644"
+        content: |
+          run_id: {{ run_id }}
+          run_number: {{ run_number }}
+          timestamp: {{ run_timestamp }}
+          durations_s:
+            warmup: {{ warmup_duration }}
+            main:   {{ main_duration }}
+            idle:   {{ idle_duration }}
+          rps:
+            warmup: {{ warmup_rps }}
+            main:   {{ main_rps }}
+          wrk:
+            threads: {{ wrk_threads }}
+            connections: {{ wrk_conns }}
+          wrk2_bin: {{ wrk2_bin }}
+
+    # Testsequenz für beide Orchestratoren (führt test1_tasks.yml je Orch aus)
+    - name: Führe nacheinander Swarm und Kubernetes Tests aus
+      include_tasks: test1_tasks.yml
+      loop: "{{ orchestrators }}"
+      loop_control:
+        loop_var: orch
+        label: "{{ orch }}"
