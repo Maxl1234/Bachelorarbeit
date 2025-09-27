@@ -1,0 +1,340 @@
+---
+# Test2.yml — Netzwerk-Latenz-Messungen (Single Play, nur valide Ergebnisse)
+# Erwartet inventory.ini mit Gruppen: [swarm_nodes], [k8s_nodes], [control]
+
+- name: Netzwerk Latenz Tests Single Play
+  hosts: localhost
+  gather_facts: false
+  become: yes
+
+  vars:
+    iperf_duration_s:   30
+    iperf_pause_s:      5
+    iperf_repetitions:  5
+
+    http_batches:            5
+    http_requests_per_batch: 300
+
+    k8s_iperf_nodeport: 32001
+    k8s_http_nodeport:  31080
+
+    swarm_iperf_port: 5201
+
+    results_root: results
+    kubeconfig: "/home/ubuntu/.kube/config"
+
+  tasks:
+    - name: Timestamp und Laufnummer ermitteln
+      block:
+        - set_fact:
+            run_ts: "{{ lookup('pipe','date +%Y%m%d_%H%M%S') }}"
+        - shell: |
+            set -euo pipefail
+            shopt -s nullglob
+            n=0
+            for d in {{ results_root }}/result_*_*; do
+              b="$(basename "$d")"
+              i="${b#result_}"; i="${i%%_*}"
+              [[ "$i" =~ ^[0-9]+$ ]] && (( i>n )) && n=$i
+            done
+            echo $((n+1))
+          register: next_id
+          changed_when: false
+          args: { executable: /bin/bash }
+        - set_fact:
+            run_num: "{{ next_id.stdout | int }}"
+            run_id:  "result_{{ next_id.stdout | int }}_{{ run_ts }}"
+            base_dir: "{{ results_root }}/{{ run_id }}"
+            swarm_dir: "{{ results_root }}/{{ run_id }}/swarm"
+            k8s_dir:   "{{ results_root }}/{{ run_id }}/k8s"
+            ext_dir:   "{{ results_root }}/{{ run_id }}/external"
+
+    - name: Ergebnis-Verzeichnisse anlegen
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ results_root }}"
+        - "{{ base_dir }}"
+        - "{{ swarm_dir }}"
+        - "{{ k8s_dir }}"
+        - "{{ ext_dir }}"
+
+    - name: Manager Hosts und IPs merken
+      set_fact:
+        swarm_manager_host: "{{ groups.get('swarm_nodes', [])[0] }}"
+        k8s_manager_host:   "{{ groups.get('k8s_nodes',   [])[0] }}"
+        swarm_manager_ip:   "{{ hostvars[groups.get('swarm_nodes', [])[0]].ansible_host | default(groups.get('swarm_nodes', [])[0]) }}"
+        k8s_manager_ip:     "{{ hostvars[groups.get('k8s_nodes',   [])[0]].ansible_host | default(groups.get('k8s_nodes',   [])[0]) }}"
+
+    - name: Tools lokal installieren
+      apt:
+        name: [ jq, coreutils, curl ]
+        state: present
+        update_cache: yes
+
+    - name: Dependencies iperf3 und curl auf allen Nodes installieren
+      apt:
+        name: [ iperf3, curl ]
+        state: present
+        update_cache: yes
+      loop: "{{ (groups.get('swarm_nodes', []) + groups.get('k8s_nodes', []) + groups.get('control', [])) | unique }}"
+      loop_control: { label: "{{ item }}" }
+      delegate_to: "{{ item }}"
+
+    - name: Swarm Iperf Server Container starten (host network)
+      community.docker.docker_container:
+        name: iperf3-server
+        image: networkstatic/iperf3
+        state: started
+        restart_policy: unless-stopped
+        command: [ "-s" ]
+        network_mode: host
+      delegate_to: "{{ swarm_manager_host }}"
+
+    - name: Swarm HTTP Echo Service starten (dynamischer Host-Port)
+      community.docker.docker_container:
+        name: http-echo
+        image: nginxdemos/hello
+        state: started
+        restart_policy: unless-stopped
+        published_ports:
+          - "0:80"
+      register: http_echo
+      delegate_to: "{{ swarm_manager_host }}"
+
+    - name: Swarm HTTP Host-Port merken
+      set_fact:
+        swarm_http_port: "{{ (http_echo.container.NetworkSettings.Ports['80/tcp'][0].HostPort | int) }}"
+
+    - name: Manager private IP ermitteln
+      shell: "hostname -I | awk '{print $1}'"
+      register: mgr_ip
+      changed_when: false
+      delegate_to: "{{ swarm_manager_host }}"
+
+    - name: Private IP setzen (ersetzt evtl. public ansible_host)
+      set_fact:
+        swarm_manager_ip: "{{ mgr_ip.stdout | trim }}"
+
+    - name: Metadaten speichern
+      copy:
+        dest: "{{ base_dir }}/metadata.yml"
+        mode: "0644"
+        content: |
+          test: network_latency
+          run_id: {{ run_id }}
+          timestamp: {{ run_ts }}
+          iperf:
+            repetitions: {{ iperf_repetitions }}
+            duration_s:  {{ iperf_duration_s }}
+            pause_s:     {{ iperf_pause_s }}
+          http:
+            batches:   {{ http_batches }}
+            per_batch: {{ http_requests_per_batch }}
+          k8s_nodeports:
+            iperf: {{ k8s_iperf_nodeport }}
+            http:  {{ k8s_http_nodeport }}
+          swarm_ports:
+            iperf: {{ swarm_iperf_port }}
+            http:  {{ swarm_http_port }}
+
+    - name: Swarm warten bis Iperf TCP erreichbar ist
+      wait_for:
+        host: "127.0.0.1"
+        port: "{{ swarm_iperf_port }}"
+        timeout: 60
+      delegate_to: "{{ swarm_manager_host }}"
+
+    - name: Swarm warten bis HTTP erreichbar ist
+      wait_for:
+        host: "127.0.0.1"
+        port: "{{ swarm_http_port }}"
+        timeout: 60
+      delegate_to: "{{ swarm_manager_host }}"
+
+    - name: K8s Iperf Deployment erstellen
+      k8s:
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata: { name: iperf3-server, namespace: default }
+          spec:
+            replicas: 1
+            selector: { matchLabels: { app: iperf3-server } }
+            template:
+              metadata: { labels: { app: iperf3-server } }
+              spec:
+                containers:
+                  - name: iperf3-server
+                    image: networkstatic/iperf3
+                    args: [ "-s" ]
+                    ports:
+                      - containerPort: 5201
+                      - containerPort: 5201
+                        protocol: UDP
+      delegate_to: "{{ k8s_manager_host }}"
+      environment: { KUBECONFIG: "{{ kubeconfig }}" }
+
+    - name: K8s Iperf Service NodePort erstellen
+      k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata: { name: iperf3-service, namespace: default }
+          spec:
+            selector: { app: iperf3-server }
+            type: NodePort
+            ports:
+              - name: tcp
+                port: 5201
+                targetPort: 5201
+                nodePort: "{{ k8s_iperf_nodeport }}"
+              - name: udp
+                port: 5201
+                targetPort: 5201
+                protocol: UDP
+      delegate_to: "{{ k8s_manager_host }}"
+      environment: { KUBECONFIG: "{{ kubeconfig }}" }
+
+    - name: K8s HTTP Echo Deployment erstellen
+      k8s:
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata: { name: http-echo, namespace: default }
+          spec:
+            replicas: 1
+            selector: { matchLabels: { app: http-echo } }
+            template:
+              metadata: { labels: { app: http-echo } }
+              spec:
+                containers:
+                  - name: http-echo
+                    image: nginxdemos/hello
+                    ports: [ { containerPort: 80 } ]
+      delegate_to: "{{ k8s_manager_host }}"
+      environment: { KUBECONFIG: "{{ kubeconfig }}" }
+
+    - name: K8s HTTP Service NodePort erstellen
+      k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata: { name: http-echo-svc, namespace: default }
+          spec:
+            selector: { app: http-echo }
+            type: NodePort
+            ports:
+              - port: 80
+                targetPort: 80
+                nodePort: "{{ k8s_http_nodeport }}"
+      delegate_to: "{{ k8s_manager_host }}"
+      environment: { KUBECONFIG: "{{ kubeconfig }}" }
+
+    - name: K8s Iperf Endpoints vorhanden
+      k8s_info:
+        api_version: v1
+        kind: Endpoints
+        name: iperf3-service
+        namespace: default
+      register: eps
+      until: >
+        (eps.resources | length) > 0 and
+        (
+          (eps.resources[0].subsets | default([]))
+          | selectattr('addresses','defined') | list | length
+        ) > 0
+      retries: 30
+      delay: 3
+      delegate_to: "{{ k8s_manager_host }}"
+      environment: { KUBECONFIG: "{{ kubeconfig }}" }
+
+    - name: K8s HTTP NodePort offen
+      wait_for:
+        host: "{{ k8s_manager_ip }}"
+        port: "{{ k8s_http_nodeport }}"
+        timeout: 60
+      delegate_to: "{{ k8s_manager_host }}"
+
+    - name: Swarm Worker und Runs setzen
+      set_fact:
+        swarm_workers: "{{ groups.get('swarm_nodes', []) | difference([swarm_manager_host]) }}"
+        swarm_runs:    "{{ range(1, iperf_repetitions + 1) | list }}"
+
+    - name: Swarm Matrix berechnen (Worker × Runs)
+      set_fact:
+        swarm_matrix: "{{ query('cartesian', swarm_workers, swarm_runs) }}"
+
+    - name: Swarm interne Messläufe starten
+      include_tasks: test2_tasks.yml
+      loop: "{{ swarm_matrix }}"
+      loop_control: { loop_var: pair, label: "{{ pair.0 }} run {{ pair.1 }}" }
+      vars:
+        mode:   "swarm_internal"
+        worker: "{{ pair.0 }}"
+        run:    "{{ pair.1 }}"
+
+    - name: K8s interne Messläufe starten
+      include_tasks: test2_tasks.yml
+      loop: "{{ range(1, iperf_repetitions + 1) | list }}"
+      loop_control: { loop_var: run, label: "run {{ run }}" }
+      vars:
+        mode: "k8s_internal"
+
+    - name: Ziele bestimmen
+      set_fact:
+        swarm_http_url: "http://{{ swarm_manager_ip }}:{{ swarm_http_port }}/"
+        k8s_http_url:   "http://{{ k8s_manager_ip }}:{{ k8s_http_nodeport }}/"
+
+    - name: Swarm HTTP Batches ausführen
+      shell: |
+        set -e
+        out="{{ ext_dir }}/swarm_batch{{ item }}.times"
+        : > "$out"
+        for i in $(seq 1 {{ http_requests_per_batch }}); do
+          curl -s -o /dev/null -w '%{time_total}\n' "{{ swarm_http_url }}" >> "$out"
+        done
+      args: { executable: /bin/bash }
+      loop: "{{ range(1, http_batches + 1) | list }}"
+
+    - name: K8s HTTP Batches ausführen
+      shell: |
+        set -e
+        out="{{ ext_dir }}/k8s_batch{{ item }}.times"
+        : > "$out"
+        for i in $(seq 1 {{ http_requests_per_batch }}); do
+          curl -s -o /dev/null -w '%{time_total}\n' "{{ k8s_http_url }}" >> "$out"
+        done
+      args: { executable: /bin/bash }
+      loop: "{{ range(1, http_batches + 1) | list }}"
+
+    - name: Percentiles berechnen und CSV schreiben
+      shell: |
+        set -euo pipefail
+        csv="{{ ext_dir }}/http_latency_summary.csv"
+        echo "target,batch,count,p50,p90,p99" > "$csv"
+        summarize() {
+          tgt="$1"; file="$2"
+          [ -s "$file" ] || return
+          cnt=$(wc -l < "$file")
+          sort -n "$file" > "$file.sorted"
+          p50_idx=$(( (cnt*50 + 99)/100 ))
+          p90_idx=$(( (cnt*90 + 99)/100 ))
+          p99_idx=$(( (cnt*99 + 99)/100 ))
+          p50=$(awk "NR==$p50_idx{print;exit}" "$file.sorted")
+          p90=$(awk "NR==$p90_idx{print;exit}" "$file.sorted")
+          p99=$(awk "NR==$p99_idx{print;exit}" "$file.sorted")
+          bname="$(basename "$file")"
+          batch="${bname##*_}"; batch="${batch%.times}"
+          echo "$tgt,$batch,$cnt,$p50,$p90,$p99" >> "$csv"
+          rm -f "$file.sorted"
+        }
+        for f in "{{ ext_dir }}"/swarm_batch*.times; do [ -e "$f" ] && summarize swarm "$f"; done
+        for f in "{{ ext_dir }}"/k8s_batch*.times;   do [ -e "$f" ] && summarize k8s   "$f"; done
+      args: { executable: /bin/bash }
