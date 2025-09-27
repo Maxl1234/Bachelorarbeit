@@ -1,0 +1,143 @@
+# Zeit der Störung (ms seit Epoch) erfassen
+- name: Zeit Injection setzen
+  set_fact:
+    t_inject_ms: "{{ lookup('pipe','date +%s%3N') | int }}"
+
+# ---------- Swarm ----------
+# Dienst am Zielnode stoppen → Störung auslösen
+- name: Swarm Docker stoppen auf failed_node
+  when: mode in ['swarm_worker','swarm_manager']
+  ansible.builtin.service:
+    name: docker
+    state: stopped
+  delegate_to: "{{ failed_node }}"
+  become: yes
+
+# Auf Recovery warten: sobald gewünschte Replikazahl wieder erreicht ist, ms-Zeit ausgeben
+- name: Swarm Recovery Endezeit messen
+  when: mode in ['swarm_worker','swarm_manager']
+  shell: |
+    set -euo pipefail
+    deadline=$(( $(date +%s) + {{ rto_timeout_s }} ))
+    want={{ ft_replicas }}
+    while true; do
+      repl=$(docker service ls --filter name={{ swarm_service_name }} --format '{{"{{"}}.Replicas{{"}}"}}' | head -n1 || true)
+      curr="${repl%%/*}"; [ -z "$curr" ] && curr=0
+      if [ "$curr" -ge "$want" ]; then date +%s%3N; exit 0; fi
+      [ "$(date +%s)" -ge "$deadline" ] && { echo TIMEOUT; exit 1; }
+      sleep 1
+    done
+  args: { executable: /bin/bash }
+  register: swarm_recovered
+  changed_when: false
+  failed_when: false
+  delegate_to: "{{ swarm_manager_host }}"
+  become: yes
+
+# Dienst am Zielnode wieder starten (Aufräumen)
+- name: Swarm Docker starten auf failed_node
+  when: mode in ['swarm_worker','swarm_manager']
+  ansible.builtin.service:
+    name: docker
+    state: started
+  delegate_to: "{{ failed_node }}"
+  become: yes
+
+# Ergebniswerte berechnen (Success/Timeout + RTO in ms)
+- name: Swarm Resultat berechnen
+  when: mode in ['swarm_worker','swarm_manager']
+  set_fact:
+    t_recovered_ms: "{{ (swarm_recovered.stdout | default('') | trim) if (swarm_recovered.stdout | default('') | trim) else '0' }}"
+    success_flag: "{{ (swarm_recovered.rc == 0) and ((swarm_recovered.stdout | default('') | trim) != 'TIMEOUT') }}"
+    rto_ms: >-
+      {{ (( (swarm_recovered.stdout | int) - (t_inject_ms | int) )
+          if (swarm_recovered.stdout | default('') | trim not in ['','TIMEOUT']) else 0 ) }}
+
+# Resultat als JSON ablegen (pfadabhängig vom Szenario)
+- name: Swarm Result JSON schreiben
+  when: mode in ['swarm_worker','swarm_manager']
+  copy:
+    dest: "{{ swarm_dir }}/ft_{{ 'worker_' ~ failed_node if mode=='swarm_worker' else 'manager_' ~ failed_node }}_run{{ run }}.json"
+    mode: "0644"
+    content: |
+      {
+        "orchestrator": "swarm",
+        "scenario": "{{ 'worker' if mode=='swarm_worker' else 'manager' }}",
+        "run": {{ run }},
+        "failed_node": "{{ failed_node }}",
+        "t_inject_ms": {{ t_inject_ms }},
+        "t_recovered_ms": {{ (t_recovered_ms | int) }},
+        "rto_ms": {{ rto_ms }},
+        "success": {{ success_flag | ternary('true','false') }}
+      }
+  delegate_to: localhost
+
+# ---------- Kubernetes ----------
+# kubelet am Zielnode stoppen → Störung auslösen
+- name: K8s kubelet stoppen auf failed_node
+  when: mode in ['k8s_worker','k8s_manager']
+  ansible.builtin.service:
+    name: kubelet
+    state: stopped
+  delegate_to: "{{ failed_node }}"
+  become: yes
+
+# Auf Recovery warten: wenn readyReplicas wieder Sollwert erreicht, ms-Zeit ausgeben
+- name: K8s Recovery Endezeit messen
+  when: mode in ['k8s_worker','k8s_manager']
+  shell: |
+    set -euo pipefail
+    deadline=$(( $(date +%s) + {{ rto_timeout_s }} ))
+    want={{ ft_replicas }}
+    while true; do
+      ready=$(kubectl --kubeconfig={{ kubeconfig }} -n {{ k8s_namespace }} \
+              get deploy {{ k8s_deploy_name }} -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0)
+      [ -z "$ready" ] && ready=0
+      if [ "$ready" -ge "$want" ]; then date +%s%3N; exit 0; fi
+      [ "$(date +%s)" -ge "$deadline" ] && { echo TIMEOUT; exit 1; }
+      sleep 1
+    done
+  args: { executable: /bin/bash }
+  register: k8s_recovered
+  changed_when: false
+  failed_when: false
+  delegate_to: "{{ k8s_manager_host }}"
+  become: yes
+
+# kubelet am Zielnode wieder starten (Aufräumen)
+- name: K8s kubelet starten auf failed_node
+  when: mode in ['k8s_worker','k8s_manager']
+  ansible.builtin.service:
+    name: kubelet
+    state: started
+  delegate_to: "{{ failed_node }}"
+  become: yes
+
+# Ergebniswerte berechnen (Success/Timeout + RTO in ms)
+- name: K8s Resultat berechnen
+  when: mode in ['k8s_worker','k8s_manager']
+  set_fact:
+    k_t_recovered_ms: "{{ (k8s_recovered.stdout | default('') | trim) if (k8s_recovered.stdout | default('') | trim) else '0' }}"
+    k_success_flag: "{{ (k8s_recovered.rc == 0) and ((k8s_recovered.stdout | default('') | trim) != 'TIMEOUT') }}"
+    k_rto_ms: >-
+      {{ (( (k8s_recovered.stdout | int) - (t_inject_ms | int) )
+          if (k8s_recovered.stdout | default('') | trim not in ['','TIMEOUT']) else 0 ) }}
+
+# Resultat als JSON ablegen (pfadabhängig vom Szenario)
+- name: K8s Result JSON schreiben
+  when: mode in ['k8s_worker','k8s_manager']
+  copy:
+    dest: "{{ k8s_dir }}/ft_{{ 'worker_' ~ failed_node if mode=='k8s_worker' else 'manager_' ~ failed_node }}_run{{ run }}.json"
+    mode: "0644"
+    content: |
+      {
+        "orchestrator": "k8s",
+        "scenario": "{{ 'worker' if mode=='k8s_worker' else 'manager' }}",
+        "run": {{ run }},
+        "failed_node": "{{ failed_node }}",
+        "t_inject_ms": {{ t_inject_ms }},
+        "t_recovered_ms": {{ (k_t_recovered_ms | int) }},
+        "rto_ms": {{ k_rto_ms }},
+        "success": {{ k_success_flag | ternary('true','false') }}
+      }
+  delegate_to: localhost
