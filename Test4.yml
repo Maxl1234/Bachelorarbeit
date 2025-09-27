@@ -1,0 +1,356 @@
+# Test4.yml – Skalierbarkeit Swarm und K8s
+- name: Test 4 Skalierbarkeit
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    enable_swarm: true
+    enable_k8s: true
+
+    swarm_manager_host: "swarm-manager"
+    k8s_manager_host: "k8s-manager"
+
+    base_dir: "results"
+
+    target_replicas_max: 6
+    scale_interval_seconds: 60
+    initial_idle_seconds: 60
+    convergence_wait_seconds: 10
+    run_label: "run1"
+
+    swarm_service_name: "scale-api"
+    swarm_image: "traefik/whoami:latest"
+    swarm_published_port: 8080
+    swarm_test_url: "http://{{ hostvars[swarm_manager_host].ansible_host | default(swarm_manager_host) }}:{{ swarm_published_port }}/"
+
+    k8s_namespace: "default"
+    k8s_deploy_name: "scale-api"
+    k8s_service_name: "scale-api"
+    k8s_image: "traefik/whoami:latest"
+    k8s_nodeport: 30080
+    k8s_test_url: "http://{{ hostvars[k8s_manager_host].ansible_host | default(k8s_manager_host) }}:{{ k8s_nodeport }}/"
+    kubeconfig: "/etc/kubernetes/admin.conf"
+
+    hey_image: "williamyeh/hey:latest"
+    hey_qps: 100
+    hey_concurrency: 50
+    hey_total_duration: "12m"
+    hey_out_swarm: "hey_swarm_{{ run_label }}.log"
+    hey_out_k8s: "hey_k8s_{{ run_label }}.log"
+
+  tasks:
+    - name: Timestamp und Laufnummer bestimmen + Pfade setzen
+      block:
+        - ansible.builtin.shell: "date -u +%Y%m%d_%H%M%S"
+          register: now_cmd
+          changed_when: false
+        - ansible.builtin.shell: |
+            set -euo pipefail
+            n=$(ls -1 {{ base_dir }} 2>/dev/null | grep -oE '^result_[0-9]+' | sed 's/result_//' | sort -n | tail -1)
+            [ -z "$n" ] && printf 1 || printf $((n+1))
+          register: run_num_cmd
+          changed_when: false
+        - ansible.builtin.set_fact:
+            now_str: "{{ now_cmd.stdout | trim }}"
+            run_number: "{{ (run_num_cmd.stdout | trim | default('1')) | int }}"
+            run_id: "result_{{ (run_num_cmd.stdout | trim | default('1')) | int }}_{{ now_cmd.stdout | trim }}"
+            result_dir: "{{ base_dir }}/result_{{ (run_num_cmd.stdout | trim | default('1')) | int }}_{{ now_cmd.stdout | trim }}"
+            swarm_dir: "{{ result_dir }}/swarm"
+            k8s_dir: "{{ result_dir }}/k8s"
+
+    - name: Ergebnis-Verzeichnisse anlegen
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ base_dir }}"
+        - "{{ result_dir }}"
+        - "{{ swarm_dir }}"
+        - "{{ k8s_dir }}"
+
+    - name: Metadaten speichern
+      ansible.builtin.copy:
+        dest: "{{ result_dir }}/metadata.yml"
+        mode: "0644"
+        content: |
+          run_id: "{{ run_id }}"
+          timestamp_utc: "{{ now_str }}"
+          enable_swarm: {{ enable_swarm }}
+          enable_k8s: {{ enable_k8s }}
+          target_replicas_max: {{ target_replicas_max }}
+          scale_interval_seconds: {{ scale_interval_seconds }}
+          initial_idle_seconds: {{ initial_idle_seconds }}
+          load:
+            hey_qps: {{ hey_qps }}
+            hey_concurrency: {{ hey_concurrency }}
+            hey_total_duration: "{{ hey_total_duration }}"
+          swarm:
+            manager_host: "{{ swarm_manager_host }}"
+            image: "{{ swarm_image }}"
+            port: {{ swarm_published_port }}
+            test_url: "{{ swarm_test_url }}"
+          k8s:
+            manager_host: "{{ k8s_manager_host }}"
+            namespace: "{{ k8s_namespace }}"
+            image: "{{ k8s_image }}"
+            nodeport: {{ k8s_nodeport }}
+            test_url: "{{ k8s_test_url }}"
+
+    # Swarm Deploy
+    - name: Swarm Service prüfen
+      when: enable_swarm | bool
+      delegate_to: "{{ swarm_manager_host }}"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        docker service inspect {{ swarm_service_name }} >/dev/null 2>&1
+      register: swarm_exists
+      failed_when: false
+      changed_when: false
+
+    - name: Swarm Service erstellen (falls fehlt)
+      when: enable_swarm | bool and swarm_exists.rc != 0
+      delegate_to: "{{ swarm_manager_host }}"
+      ansible.builtin.shell: >
+        set -euo pipefail;
+        docker service create
+        --name {{ swarm_service_name }}
+        --replicas 1
+        --publish {{ swarm_published_port }}:80
+        {{ swarm_image }}
+
+    - name: Swarm warten bis ein Task läuft
+      when: enable_swarm | bool
+      delegate_to: "{{ swarm_manager_host }}"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        docker service ps {{ swarm_service_name }} \
+          --filter 'desired-state=running' \
+          --format '{{"{{"}}.CurrentState{{"}}"}}' | grep -c '^Running' || true
+      register: swarm_running
+      retries: 120
+      delay: 2
+      until: (swarm_running.stdout | int) >= 1
+      changed_when: false
+
+    # K8s Deploy
+    - name: Liste belegter NodePorts ermitteln
+      when: enable_k8s | bool
+      delegate_to: "{{ k8s_manager_host }}"
+      become: yes
+      ansible.builtin.shell: |
+        set -euo pipefail
+        kubectl --kubeconfig={{ kubeconfig }} get svc -A \
+          -o jsonpath='{range .items[*]}{.spec.ports[*].nodePort}{"\n"}{end}' \
+        | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -n | uniq
+      register: used_nodeports
+      changed_when: false
+      failed_when: false
+
+    - name: Freien NodePort setzen (Fallback 30080)
+      when: enable_k8s | bool
+      ansible.builtin.set_fact:
+        k8s_nodeport: >-
+          {{
+            (range(30080, 30101) | list)
+            | difference( (used_nodeports.stdout_lines | default([])) | map('int') | list )
+            | first | default(30080)
+          }}
+
+    - name: K8s Manifest schreiben
+      when: enable_k8s | bool
+      delegate_to: "{{ k8s_manager_host }}"
+      ansible.builtin.copy:
+        dest: "/tmp/scale-api.yaml"
+        mode: "0644"
+        content: |
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: {{ k8s_deploy_name }}
+            namespace: {{ k8s_namespace }}
+            labels: { app: {{ k8s_deploy_name }} }
+          spec:
+            replicas: 1
+            selector: { matchLabels: { app: {{ k8s_deploy_name }} } }
+            template:
+              metadata: { labels: { app: {{ k8s_deploy_name }} } }
+              spec:
+                containers:
+                - name: app
+                  image: "{{ k8s_image }}"
+                  ports: [{ containerPort: 80 }]
+                  readinessProbe: { httpGet: { path: "/", port: 80 }, initialDelaySeconds: 2, periodSeconds: 5, failureThreshold: 6 }
+                  livenessProbe:  { httpGet: { path: "/", port: 80 }, initialDelaySeconds: 5, periodSeconds: 10, failureThreshold: 6 }
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: {{ k8s_service_name }}
+            namespace: {{ k8s_namespace }}
+            labels: { app: {{ k8s_deploy_name }} }
+          spec:
+            type: NodePort
+            selector: { app: {{ k8s_deploy_name }} }
+            ports:
+            - name: http
+              port: 80
+              targetPort: 80
+              nodePort: {{ k8s_nodeport }}
+
+    - name: K8s apply
+      when: enable_k8s | bool
+      delegate_to: "{{ k8s_manager_host }}"
+      become: yes
+      ansible.builtin.shell: |
+        set -euo pipefail
+        kubectl --kubeconfig={{ kubeconfig }} apply -f /tmp/scale-api.yaml
+      register: k8s_apply
+      changed_when: "'created' in (k8s_apply.stdout | default('')) or 'configured' in (k8s_apply.stdout | default(''))"
+
+    - name: K8s warten bis eine Replica verfügbar ist
+      when: enable_k8s | bool
+      delegate_to: "{{ k8s_manager_host }}"
+      become: yes
+      ansible.builtin.shell: |
+        set -euo pipefail
+        kubectl --kubeconfig={{ kubeconfig }} -n {{ k8s_namespace }} \
+          get deploy {{ k8s_deploy_name }} -o jsonpath='{.status.availableReplicas}'
+      register: k8s_avail
+      retries: 180
+      delay: 2
+      until: (k8s_avail.stdout | trim) == "1"
+      changed_when: false
+
+    # Idle und Laststart
+    - name: Idle vor Laststart
+      ansible.builtin.pause:
+        seconds: "{{ initial_idle_seconds }}"
+
+    - name: hey-Image auf Managern pullen
+      delegate_to: "{{ item.host }}"
+      become: "{{ item.become | default(false) }}"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        docker pull {{ hey_image }}
+      loop:
+        - { host: "{{ swarm_manager_host }}", become: false }
+        - { host: "{{ k8s_manager_host }}",  become: true }
+      changed_when: false
+      failed_when: false
+
+    - name: starte hey swarm remote
+      when: enable_swarm | bool
+      delegate_to: "{{ swarm_manager_host }}"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        nohup docker run --rm --name hey_swarm_{{ run_id }} {{ hey_image }} \
+          -z {{ hey_total_duration }} -q {{ hey_qps }} -c {{ hey_concurrency }} \
+          "{{ swarm_test_url }}" > "/tmp/{{ hey_out_swarm }}" 2>&1 &
+        echo $! > "/tmp/hey_swarm.pid"
+      args: { executable: /bin/bash }
+
+    - name: starte hey k8s remote
+      when: enable_k8s | bool
+      delegate_to: "{{ k8s_manager_host }}"
+      become: yes
+      ansible.builtin.shell: |
+        set -euo pipefail
+        nohup docker run --rm --name hey_k8s_{{ run_id }} {{ hey_image }} \
+          -z {{ hey_total_duration }} -q {{ hey_qps }} -c {{ hey_concurrency }} \
+          "{{ k8s_test_url }}" > "/tmp/{{ hey_out_k8s }}" 2>&1 &
+        echo $! > "/tmp/hey_k8s.pid"
+      args: { executable: /bin/bash }
+
+    # Skalierschritte (externes Taskfile test4_tasks.yml)
+    - name: Skaliere Swarm schrittweise
+      when: enable_swarm | bool
+      include_tasks: test4_tasks.yml
+      loop: "{{ range(2, target_replicas_max + 1) | list }}"
+      loop_control: { loop_var: r }
+      vars:
+        mode: "swarm"
+        replicas: "{{ r }}"
+
+    - name: Skaliere K8s schrittweise
+      when: enable_k8s | bool
+      include_tasks: test4_tasks.yml
+      loop: "{{ range(2, target_replicas_max + 1) | list }}"
+      loop_control: { loop_var: r }
+      vars:
+        mode: "k8s"
+        replicas: "{{ r }}"
+
+    # Auf hey-Ende warten + Logs holen
+    - name: warte auf hey swarm ende
+      when: enable_swarm | bool
+      delegate_to: "{{ swarm_manager_host }}"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        name="hey_swarm_{{ run_id }}"
+        pidfile="/tmp/hey_swarm.pid"
+        while :; do
+          if docker ps --format '{{"{{"}}.Names{{"}}"}}' | grep -qx "$name"; then sleep 2; continue; fi
+          if [ -s "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then sleep 2; continue; fi
+          break
+        done
+      args: { executable: /bin/bash }
+      changed_when: false
+
+    - name: warte auf hey k8s ende
+      when: enable_k8s | bool
+      delegate_to: "{{ k8s_manager_host }}"
+      become: yes
+      ansible.builtin.shell: |
+        set -euo pipefail
+        name="hey_k8s_{{ run_id }}"
+        pidfile="/tmp/hey_k8s.pid"
+        while :; do
+          if docker ps --format '{{"{{"}}.Names{{"}}"}}' | grep -qx "$name"; then sleep 2; continue; fi
+          if [ -s "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then sleep 2; continue; fi
+          break
+        done
+      args: { executable: /bin/bash }
+      changed_when: false
+
+    - name: pruefe hey swarm log existiert
+      when: enable_swarm | bool
+      delegate_to: "{{ swarm_manager_host }}"
+      ansible.builtin.stat:
+        path: "/tmp/{{ hey_out_swarm }}"
+      register: swarm_log_stat
+
+    - name: kopiere hey swarm log
+      when: enable_swarm | bool and swarm_log_stat.stat.exists
+      delegate_to: "{{ swarm_manager_host }}"
+      ansible.builtin.fetch:
+        src: "/tmp/{{ hey_out_swarm }}"
+        dest: "{{ result_dir }}/"
+        flat: true
+
+    - name: pruefe hey k8s log existiert
+      when: enable_k8s | bool
+      delegate_to: "{{ k8s_manager_host }}"
+      become: yes
+      ansible.builtin.stat:
+        path: "/tmp/{{ hey_out_k8s }}"
+      register: k8s_log_stat
+
+    - name: kopiere hey k8s log
+      when: enable_k8s | bool and k8s_log_stat.stat.exists
+      delegate_to: "{{ k8s_manager_host }}"
+      ansible.builtin.fetch:
+        src: "/tmp/{{ hey_out_k8s }}"
+        dest: "{{ result_dir }}/"
+        flat: true
+
+    - name: entferne hey pids remote
+      delegate_to: "{{ item }}"
+      ansible.builtin.file:
+        path: "/tmp/hey_{{ 'swarm' if item == swarm_manager_host else 'k8s' }}.pid"
+        state: absent
+      loop:
+        - "{{ swarm_manager_host }}"
+        - "{{ k8s_manager_host }}"
+      failed_when: false
+      changed_when: false
