@@ -1,0 +1,371 @@
+---
+- name: Fehlertoleranz Tests Single Play
+  hosts: localhost
+  become: yes
+  gather_facts: false
+
+  vars:
+    # Schalter
+    enable_swarm: true
+    enable_k8s: true
+
+    # Ziel-Hosts (aus inventory.ini)
+    swarm_manager_host: "swarm-manager"
+    swarm_victim_host: "swarm-node1"
+    k8s_manager_host: "k8s-manager"
+    k8s_victim_host: "k8s-node1"
+
+    # Test-Parameter
+    ft_replicas: 3
+    stabilize_wait_seconds: 45
+    rto_timeout_s: 300
+    base_dir: "results"
+
+    # Swarm Service
+    swarm_service_name: "ft-batch"
+    swarm_image: "nginx:alpine"
+    swarm_health_cmd: "wget -qO- http://127.0.0.1:80 || exit 1"
+
+    # Kubernetes
+    kubeconfig: "/etc/kubernetes/admin.conf"
+    k8s_namespace: "default"
+    k8s_deploy_name: "ft-batch"
+    k8s_image: "nginx:alpine"
+
+  tasks:
+    # IDs & Pfade bestimmen und anlegen
+    - name: Timestamp (UTC) und Laufnummer ermitteln
+      block:
+        - ansible.builtin.shell: "date -u +%Y%m%d_%H%M%S"
+          register: now_cmd
+          changed_when: false
+        - ansible.builtin.shell: |
+            set -euo pipefail
+            n=$(ls -1 {{ base_dir }} 2>/dev/null | grep -oE '^result_[0-9]+' | sed 's/result_//' | sort -n | tail -1)
+            [ -z "$n" ] && printf 1 || printf $((n+1))
+          register: run_num_cmd
+          changed_when: false
+        - ansible.builtin.set_fact:
+            now_str: "{{ now_cmd.stdout | trim }}"
+            run_number: "{{ (run_num_cmd.stdout | trim | default('1')) | int }}"
+            run_id: "result_{{ (run_num_cmd.stdout | trim | default('1')) | int }}_{{ now_cmd.stdout | trim }}"
+            result_dir: "{{ base_dir }}/result_{{ (run_num_cmd.stdout | trim | default('1')) | int }}_{{ now_cmd.stdout | trim }}"
+            swarm_dir: "{{ base_dir }}/result_{{ (run_num_cmd.stdout | trim | default('1')) | int }}_{{ now_cmd.stdout | trim }}/swarm"
+            k8s_dir:   "{{ base_dir }}/result_{{ (run_num_cmd.stdout | trim | default('1')) | int }}_{{ now_cmd.stdout | trim }}/k8s"
+
+    - name: Ergebnis-Verzeichnisse anlegen
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ base_dir }}"
+        - "{{ result_dir }}"
+        - "{{ swarm_dir }}"
+        - "{{ k8s_dir }}"
+
+    - name: Metadaten speichern
+      ansible.builtin.copy:
+        dest: "{{ result_dir }}/metadata.yml"
+        mode: "0644"
+        content: |
+          run_id: "{{ run_id }}"
+          timestamp_utc: "{{ now_str }}"
+          ft_replicas: {{ ft_replicas }}
+          enable_swarm: {{ enable_swarm }}
+          enable_k8s: {{ enable_k8s }}
+          swarm:
+            manager: "{{ swarm_manager_host }}"
+            victim: "{{ swarm_victim_host }}"
+            image: "{{ swarm_image }}"
+            health_cmd: "{{ swarm_health_cmd }}"
+          k8s:
+            manager: "{{ k8s_manager_host }}"
+            victim: "{{ k8s_victim_host }}"
+            namespace: "{{ k8s_namespace }}"
+            image: "{{ k8s_image }}"
+
+    # ===== Swarm =====
+    - name: Swarm Defaults setzen
+      set_fact:
+        ft_service_name: "{{ ft_service_name | default('ft-batch') }}"
+        ft_replicas: "{{ ft_replicas | default(3) }}"
+
+    - name: Swarm aktiv prüfen
+      when: enable_swarm | bool
+      delegate_to: "{{ swarm_manager_host }}"
+      ansible.builtin.shell: "docker info --format '{% raw %}{{.Swarm.LocalNodeState}}{% endraw %}'"
+      register: swarm_state
+      changed_when: false
+
+    - name: Abbrechen wenn Swarm nicht aktiv
+      when: enable_swarm | bool and (swarm_state.stdout | trim != 'active')
+      ansible.builtin.fail:
+        msg: "Swarm ist nicht aktiv auf {{ swarm_manager_host }} (State={{ swarm_state.stdout | default('n/a') }})"
+
+    - name: Swarm Service existiert?
+      when: enable_swarm | bool
+      delegate_to: "{{ swarm_manager_host }}"
+      ansible.builtin.shell: "docker service inspect {{ swarm_service_name }} >/dev/null 2>&1"
+      register: swarm_service_exists
+      failed_when: false
+      changed_when: false
+
+    - name: Swarm Service anlegen (falls fehlt)
+      when: enable_swarm | bool and swarm_service_exists.rc != 0
+      delegate_to: "{{ swarm_manager_host }}"
+      ansible.builtin.shell: >
+        docker service create
+        --name {{ swarm_service_name }}
+        --replicas {{ ft_replicas }}
+        {% if swarm_health_cmd|length > 0 %}
+        --health-cmd '{{ swarm_health_cmd }}'
+        --health-interval 10s
+        --health-timeout 2s
+        --health-start-period 15s
+        --health-retries 6
+        {% endif %}
+        {{ swarm_image }}
+        sh -lc 'dd if=/dev/zero of=/dev/null & exec nginx -g "daemon off;"'
+
+    - name: Swarm Service Healthcheck deaktivieren
+      when: enable_swarm | bool
+      delegate_to: "{{ swarm_manager_host }}"
+      ansible.builtin.shell: >
+        docker service update --no-healthcheck {{ swarm_service_name }}
+      register: swarm_hc_off
+      changed_when: "'verify' not in (swarm_hc_off.stdout | lower | default(''))"
+
+    - name: Swarm aktuelle Replikas lesen
+      when: enable_swarm | bool
+      delegate_to: "{{ swarm_manager_host }}"
+      ansible.builtin.shell: "docker service inspect {{ swarm_service_name }} --format '{% raw %}{{.Spec.Mode.Replicated.Replicas}}{% endraw %}'"
+      register: swarm_curr_repl
+      changed_when: false
+      failed_when: false
+
+    - name: Swarm auf Soll-Replicas skalieren
+      when: enable_swarm | bool and (swarm_curr_repl.stdout | int) != (ft_replicas | int)
+      delegate_to: "{{ swarm_manager_host }}"
+      ansible.builtin.shell: "docker service scale -d {{ swarm_service_name }}={{ ft_replicas }}"
+      register: swarm_scale
+      changed_when: "'scaled' in (swarm_scale.stdout | default('')) or swarm_scale.rc == 0"
+
+    - name: Warten bis alle Replikas Running
+      when: enable_swarm | bool
+      delegate_to: "{{ swarm_manager_host }}"
+      ansible.builtin.shell: |
+        set -e
+        svc="{{ swarm_service_name }}"
+        docker service ps "$svc" --filter 'desired-state=running' \
+          --format '{{"{{"}}.CurrentState{{"}}"}}' | grep -c '^Running' || true
+      register: swarm_running_count
+      retries: 60
+      delay: 2
+      until: (swarm_running_count.stdout | int) >= (ft_replicas | int)
+      changed_when: false
+
+    - name: Stabilisieren vor Störung
+      when: enable_swarm | bool
+      ansible.builtin.pause:
+        seconds: "{{ stabilize_wait_seconds }}"
+
+    - name: Startzeit messen (t0)
+      when: enable_swarm | bool
+      delegate_to: "{{ swarm_manager_host }}"
+      ansible.builtin.shell: "date -u +%s"
+      register: t0_swarm
+      changed_when: false
+
+    - name: Docker am Opfer-Worker stoppen
+      when: enable_swarm | bool
+      delegate_to: "{{ swarm_victim_host }}"
+      ansible.builtin.shell: "systemctl stop docker"
+
+    - name: Warten bis Service wieder vollständig läuft
+      when: enable_swarm | bool
+      delegate_to: "{{ swarm_manager_host }}"
+      ansible.builtin.shell: |
+        set -e
+        svc="{{ swarm_service_name }}"
+        docker service ps "$svc" --filter 'desired-state=running' \
+          --format '{{"{{"}}.CurrentState{{"}}"}}' | grep -c '^Running' || true
+      register: swarm_running_after
+      retries: 240
+      delay: 2
+      until: (swarm_running_after.stdout | int) >= (ft_replicas | int)
+      changed_when: false
+
+    - name: Endzeit messen (t1)
+      when: enable_swarm | bool
+      delegate_to: "{{ swarm_manager_host }}"
+      ansible.builtin.shell: "date -u +%s"
+      register: t1_swarm
+      changed_when: false
+
+    - name: Recovery-Dauer berechnen
+      when: enable_swarm | bool
+      ansible.builtin.set_fact:
+        swarm_recovery_seconds: "{{ (t1_swarm.stdout | int) - (t0_swarm.stdout | int) }}"
+
+    - name: Ergebnis JSON (Swarm) schreiben
+      when: enable_swarm | bool
+      ansible.builtin.copy:
+        dest: "{{ swarm_dir }}/recovery_run1.json"
+        mode: "0644"
+        content: |
+          {
+            "orchestrator": "swarm",
+            "run": 1,
+            "replicas": {{ ft_replicas }},
+            "victim_host": "{{ swarm_victim_host }}",
+            "recovery_seconds": {{ swarm_recovery_seconds }},
+            "timestamp_utc_start": {{ t0_swarm.stdout | int }},
+            "timestamp_utc_end": {{ t1_swarm.stdout | int }}
+          }
+
+    - name: Docker am Opfer-Worker wieder starten
+      when: enable_swarm | bool
+      delegate_to: "{{ swarm_victim_host }}"
+      ansible.builtin.shell: "systemctl start docker"
+      register: restart_docker_victim
+      changed_when: restart_docker_victim.rc == 0
+
+    # ===== Kubernetes =====
+    - name: K8s Namespace anlegen (falls != default)
+      when: enable_k8s | bool and k8s_namespace != "default"
+      delegate_to: "{{ k8s_manager_host }}"
+      ansible.builtin.shell: >
+        kubectl --kubeconfig={{ kubeconfig }} get ns {{ k8s_namespace }} >/dev/null 2>&1
+        || kubectl --kubeconfig={{ kubeconfig }} create ns {{ k8s_namespace }}
+      changed_when: false
+      failed_when: false
+
+    - name: K8s Deployment-Manifest auf Manager schreiben
+      when: enable_k8s | bool
+      delegate_to: "{{ k8s_manager_host }}"
+      ansible.builtin.copy:
+        dest: "/tmp/ft-batch-deploy.yaml"
+        mode: "0644"
+        content: |
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: {{ k8s_deploy_name }}
+            namespace: {{ k8s_namespace }}
+            labels: { app: {{ k8s_deploy_name }} }
+          spec:
+            replicas: {{ ft_replicas }}
+            selector: { matchLabels: { app: {{ k8s_deploy_name }} } }
+            template:
+              metadata: { labels: { app: {{ k8s_deploy_name }} } }
+              spec:
+                containers:
+                  - name: app
+                    image: "{{ k8s_image }}"
+                    command: ["sh","-lc"]
+                    args: ["dd if=/dev/zero of=/dev/null & exec nginx -g 'daemon off;'"]
+                    ports: [ { containerPort: 80 } ]
+                    readinessProbe:
+                      httpGet: { path: "/", port: 80 }
+                      initialDelaySeconds: 10
+                      periodSeconds: 10
+                      failureThreshold: 6
+                    livenessProbe:
+                      httpGet: { path: "/", port: 80 }
+                      initialDelaySeconds: 20
+                      periodSeconds: 10
+                      failureThreshold: 6
+
+    - name: K8s Deployment apply
+      when: enable_k8s | bool
+      delegate_to: "{{ k8s_manager_host }}"
+      ansible.builtin.shell: "kubectl --kubeconfig={{ kubeconfig }} apply -f /tmp/ft-batch-deploy.yaml"
+      register: k8s_apply
+      changed_when: "'created' in (k8s_apply.stdout | default('')) or 'configured' in (k8s_apply.stdout | default(''))"
+
+    - name: K8s warten bis alle Replicas Available
+      when: enable_k8s | bool
+      delegate_to: "{{ k8s_manager_host }}"
+      ansible.builtin.shell: >
+        kubectl --kubeconfig={{ kubeconfig }} -n {{ k8s_namespace }}
+        get deploy {{ k8s_deploy_name }} -o jsonpath='{.status.availableReplicas}'
+      register: k8s_wait_ready
+      retries: 60
+      delay: 2
+      until: (k8s_wait_ready.stdout | trim) == (ft_replicas | string)
+
+    - name: Stabilisieren vor Störung (K8s)
+      when: enable_k8s | bool
+      ansible.builtin.pause:
+        seconds: "{{ stabilize_wait_seconds }}"
+
+    - name: K8s Startzeit messen (t0)
+      when: enable_k8s | bool
+      delegate_to: "{{ k8s_manager_host }}"
+      ansible.builtin.shell: "date -u +%s"
+      register: t0_k8s
+      changed_when: false
+
+    - name: kubelet am Opfer-Worker stoppen
+      when: enable_k8s | bool
+      delegate_to: "{{ k8s_victim_host }}"
+      ansible.builtin.shell: "systemctl stop kubelet"
+
+    - name: K8s warten bis wieder alle Replicas Available
+      when: enable_k8s | bool
+      delegate_to: "{{ k8s_manager_host }}"
+      ansible.builtin.shell: >
+        kubectl --kubeconfig={{ kubeconfig }} -n {{ k8s_namespace }}
+        get deploy {{ k8s_deploy_name }} -o jsonpath='{.status.availableReplicas}'
+      register: k8s_wait_after
+      retries: 240
+      delay: 2
+      until: (k8s_wait_after.stdout | trim) == (ft_replicas | string)
+
+    - name: K8s Endzeit messen (t1)
+      when: enable_k8s | bool
+      delegate_to: "{{ k8s_manager_host }}"
+      ansible.builtin.shell: "date -u +%s"
+      register: t1_k8s
+      changed_when: false
+
+    - name: Ergebnis JSON (K8s) schreiben
+      when: enable_k8s | bool
+      ansible.builtin.copy:
+        dest: "{{ k8s_dir }}/recovery_run1.json"
+        mode: "0644"
+        content: |
+          {
+            "orchestrator": "k8s",
+            "run": 1,
+            "replicas": {{ ft_replicas }},
+            "victim_host": "{{ k8s_victim_host }}",
+            "recovery_seconds": {{ (t1_k8s.stdout | int) - (t0_k8s.stdout | int) }},
+            "timestamp_utc_start": {{ t0_k8s.stdout | int }},
+            "timestamp_utc_end": {{ t1_k8s.stdout | int }}
+          }
+
+    - name: kubelet am Opfer-Worker wieder starten
+      when: enable_k8s | bool
+      delegate_to: "{{ k8s_victim_host }}"
+      ansible.builtin.shell: "systemctl start kubelet"
+      register: start_kubelet_victim
+      changed_when: start_kubelet_victim.rc == 0
+
+    # Zusatzläufe via externem Taskfile (Failure x2)
+    - name: Swarm Worker-Failure x2
+      include_tasks: test3_tasks.yml
+      loop: "{{ range(1, 3) | list }}"
+      loop_control: { loop_var: run, label: "swarm run {{ run }}" }
+      vars:
+        mode: "swarm_worker"
+        failed_node: "{{ swarm_victim_host }}"
+
+    - name: K8s Worker-Failure x2
+      include_tasks: test3_tasks.yml
+      loop: "{{ range(1, 3) | list }}"
+      loop_control: { loop_var: run, label: "k8s run {{ run }}" }
+      vars:
+        mode: "k8s_worker"
+        failed_node: "{{ k8s_victim_host }}"
