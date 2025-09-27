@@ -1,0 +1,182 @@
+# Startzeit erfassen (UTC Sekunden)
+- name: Ermittele Startzeit sekunden
+  ansible.builtin.shell: "date -u +%s"
+  register: t0
+  changed_when: false
+
+# Swarm: auf Ziel-Repliken skalieren
+- name: Swarm skaliere auf Ziel
+  when: mode == 'swarm'
+  delegate_to: "{{ swarm_manager_host }}"
+  ansible.builtin.shell: |
+    set -euo pipefail
+    docker service scale -d {{ swarm_service_name }}={{ replicas }}
+  register: swarm_scale
+  changed_when: "'scaled' in (swarm_scale.stdout | default('')) or swarm_scale.rc == 0"
+
+# K8s: auf Ziel-Repliken skalieren
+- name: K8s skaliere auf Ziel
+  when: mode == 'k8s'
+  delegate_to: "{{ k8s_manager_host }}"
+  become: yes
+  ansible.builtin.shell: |
+    set -euo pipefail
+    kubectl --kubeconfig={{ kubeconfig }} -n {{ k8s_namespace }} \
+      scale deploy {{ k8s_deploy_name }} --replicas={{ replicas }}
+  register: k8s_scale
+  changed_when: "'scaled' in (k8s_scale.stdout | default('')) or k8s_scale.rc == 0"
+
+# kurze Konvergenzpause
+- name: Warte kurze Konvergenz
+  ansible.builtin.pause:
+    seconds: "{{ convergence_wait_seconds }}"
+
+# Swarm: warten bis Running-Tasks == Ziel
+- name: Swarm warte bis Running Tasks erreichen Ziel
+  when: mode == 'swarm'
+  delegate_to: "{{ swarm_manager_host }}"
+  ansible.builtin.shell: |
+    set -euo pipefail
+    docker service ps {{ swarm_service_name }} \
+      --filter 'desired-state=running' \
+      --format '{{"{{"}}.CurrentState{{"}}"}}' | grep -c '^Running' || true
+  register: swarm_running_after
+  retries: 180
+  delay: 2
+  until: (swarm_running_after.stdout | int) >= (replicas | int)
+  changed_when: false
+
+# K8s: warten bis AvailableReplicas == Ziel
+- name: K8s warte bis Available Replicas erreichen Ziel
+  when: mode == 'k8s'
+  delegate_to: "{{ k8s_manager_host }}"
+  become: yes
+  ansible.builtin.shell: |
+    set -euo pipefail
+    kubectl --kubeconfig={{ kubeconfig }} -n {{ k8s_namespace }} \
+      get deploy {{ k8s_deploy_name }} -o jsonpath='{.status.availableReplicas}'
+  register: k8s_ready_after
+  retries: 240
+  delay: 2
+  until: (k8s_ready_after.stdout | trim) == (replicas | string)
+  changed_when: false
+
+# HTTP-Check (200) für beide Pfade
+- name: HTTP Check Swarm
+  when: mode == 'swarm'
+  delegate_to: localhost
+  ansible.builtin.uri:
+    url: "{{ swarm_test_url }}"
+    method: GET
+    status_code: 200
+    return_content: false
+  register: http_ok_swarm
+  retries: 60
+  delay: 2
+  until: http_ok_swarm.status == 200
+
+- name: HTTP Check K8s
+  when: mode == 'k8s'
+  delegate_to: localhost
+  ansible.builtin.uri:
+    url: "{{ k8s_test_url }}"
+    method: GET
+    status_code: 200
+    return_content: false
+  register: http_ok_k8s
+  retries: 60
+  delay: 2
+  until: http_ok_k8s.status == 200
+
+# Endzeit erfassen
+- name: Ermittele Endzeit sekunden
+  ansible.builtin.shell: "date -u +%s"
+  register: t1
+  changed_when: false
+
+# (optional) Prometheus-Abfragen – nur wenn prom_url gesetzt
+- name: Prometheus Swarm CPU abfragen
+  when: mode == 'swarm' and prom_url | length > 0
+  delegate_to: localhost
+  ansible.builtin.uri:
+    url: "{{ prom_url }}/api/v1/query?query={{ swarm_prom_cpu | urlencode }}"
+    return_content: true
+  register: prom_swarm_cpu_q
+  failed_when: false
+  changed_when: false
+
+- name: Prometheus Swarm Memory abfragen
+  when: mode == 'swarm' and prom_url | length > 0
+  delegate_to: localhost
+  ansible.builtin.uri:
+    url: "{{ prom_url }}/api/v1/query?query={{ swarm_prom_mem | urlencode }}"
+    return_content: true
+  register: prom_swarm_mem_q
+  failed_when: false
+  changed_when: false
+
+- name: Prometheus K8s CPU abfragen
+  when: mode == 'k8s' and prom_url | length > 0
+  delegate_to: localhost
+  ansible.builtin.uri:
+    url: "{{ prom_url }}/api/v1/query?query={{ k8s_prom_cpu | urlencode }}"
+    return_content: true
+  register: prom_k_cpu_q
+  failed_when: false
+  changed_when: false
+
+- name: Prometheus K8s Memory abfragen
+  when: mode == 'k8s' and prom_url | length > 0
+  delegate_to: localhost
+  ansible.builtin.uri:
+    url: "{{ prom_url }}/api/v1/query?query={{ k8s_prom_mem | urlencode }}"
+    return_content: true
+  register: prom_k_mem_q
+  failed_when: false
+  changed_when: false
+
+# Ergebnisse persistieren (Zeiten, HTTP 200, optionale Prom-Daten)
+- name: Ergebnis schreiben Swarm
+  when: mode == 'swarm'
+  delegate_to: localhost
+  ansible.builtin.copy:
+    dest: "{{ swarm_dir }}/scale_r{{ replicas }}_{{ run_label }}.json"
+    mode: "0644"
+    content: |
+      {
+        "orchestrator": "swarm",
+        "run_label": "{{ run_label }}",
+        "replicas": {{ replicas }},
+        "t_scale_start": {{ t0.stdout | int }},
+        "t_scale_end": {{ t1.stdout | int }},
+        "time_to_service_sec": {{ (t1.stdout | int) - (t0.stdout | int) }},
+        "http_200": true,
+        "prom_cpu": {{ (prom_swarm_cpu_q.json.data.result[0].value[1] | float) if (prom_url|length>0 and (prom_swarm_cpu_q.json.data.result | length) > 0) else "null" }},
+        "prom_mem_bytes": {{ (prom_swarm_mem_q.json.data.result[0].value[1] | float) if (prom_url|length>0 and (prom_swarm_mem_q.json.data.result | length) > 0) else "null" }}
+      }
+
+- name: Ergebnis schreiben K8s
+  when: mode == 'k8s'
+  delegate_to: localhost
+  ansible.builtin.copy:
+    dest: "{{ k8s_dir }}/scale_r{{ replicas }}_{{ run_label }}.json"
+    mode: "0644"
+    content: |
+      {
+        "orchestrator": "k8s",
+        "run_label": "{{ run_label }}",
+        "replicas": {{ replicas }},
+        "t_scale_start": {{ t0.stdout | int }},
+        "t_scale_end": {{ t1.stdout | int }},
+        "time_to_service_sec": {{ (t1.stdout | int) - (t0.stdout | int) }},
+        "http_200": true,
+        "prom_cpu": {{ (prom_k_cpu_q.json.data.result[0].value[1] | float) if (prom_url|length>0 and (prom_k_cpu_q.json.data.result | length) > 0) else "null" }},
+        "prom_mem_bytes": {{ (prom_k_mem_q.json.data.result[0].value[1] | float) if (prom_url|length>0 and (prom_k_mem_q.json.data.result | length) > 0) else "null" }}
+      }
+
+# Pause bis zum nächsten Skalierungsschritt (nur wenn noch Luft nach oben)
+- name: Warte bis naechster Skalierungsschritt
+  when: replicas < target_replicas_max
+  delegate_to: localhost
+  ansible.builtin.pause:
+    seconds: "{{ scale_interval_seconds }}"
