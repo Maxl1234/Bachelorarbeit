@@ -1,0 +1,231 @@
+# SWARM: TCP- und UDP-Run auf dem Worker (JSON erfassen, Fehler tolerieren)
+- name: "SWARM TCP JSON"
+  when: mode == 'swarm_internal'
+  shell: |
+    set -euo pipefail
+    timeout {{ (iperf_duration_s | int) + 60 }}s \
+      iperf3 -J -c {{ swarm_manager_ip }} -p {{ swarm_iperf_port }} \
+             -t {{ iperf_duration_s }} -i 1
+  args: { executable: /bin/bash }
+  register: res_tcp
+  changed_when: false
+  failed_when: false
+  delegate_to: "{{ worker }}"
+
+- name: "SWARM UDP JSON 10mbit"
+  when: mode == 'swarm_internal'
+  shell: |
+    set -euo pipefail
+    timeout {{ (iperf_duration_s | int) + 60 }}s \
+      iperf3 -J -u -b 10M -c {{ swarm_manager_ip }} -p {{ swarm_iperf_port }} \
+             -t {{ iperf_duration_s }} -i 1
+  args: { executable: /bin/bash }
+  register: res_udp
+  changed_when: false
+  failed_when: false
+  delegate_to: "{{ worker }}"
+
+# Valid-Flags: JSON vorhanden und kein "error" – rc ist egal
+- name: SWARM Valid Flags setzen
+  when: mode == 'swarm_internal'
+  set_fact:
+    swarm_valid_tcp: >-
+      {{ (res_tcp.stdout | default('') | trim | length > 0)
+         and ('"error"' not in (res_tcp.stdout | default(''))) }}
+    swarm_valid_udp: >-
+      {{ (res_udp.stdout | default('') | trim | length > 0)
+         and ('"error"' not in (res_udp.stdout | default(''))) }}
+
+# Debug: Roh-Outputs immer ablegen
+- name: SWARM Raw-Output immer sichern (Debug)
+  when: mode == 'swarm_internal'
+  copy:
+    dest: "{{ swarm_dir }}/worker_{{ worker }}_run{{ run }}.raw.txt"
+    mode: "0644"
+    content: |
+      rc_tcp={{ res_tcp.rc | default('undef') }}
+      rc_udp={{ res_udp.rc | default('undef') }}
+
+      --- TCP stdout ---
+      {{ (res_tcp.stdout | default('')) | trim }}
+
+      --- TCP stderr ---
+      {{ (res_tcp.stderr | default('')) | trim }}
+
+      --- UDP stdout ---
+      {{ (res_udp.stdout | default('')) | trim }}
+
+      --- UDP stderr ---
+      {{ (res_udp.stderr | default('')) | trim }}
+  delegate_to: localhost
+
+# Nur valide Ergebnisse als JSON speichern
+- name: SWARM Ergebnis speichern Controller nur valide
+  when: mode == 'swarm_internal' and (swarm_valid_tcp or swarm_valid_udp)
+  copy:
+    dest: "{{ swarm_dir }}/worker_{{ worker }}_run{{ run }}.json"
+    mode: "0644"
+    content: |
+      {
+        "orchestrator":"swarm",
+        "worker":"{{ worker }}",
+        "run":{{ run }}{% if swarm_valid_tcp %},
+        "tcp": {{ res_tcp.stdout }}{% endif %}{% if swarm_valid_udp %},
+        "udp": {{ res_udp.stdout }}{% endif %}
+      }
+  delegate_to: localhost
+
+# Pause zwischen Läufen
+- name: Pause zwischen Laeufen Swarm
+  when: mode == 'swarm_internal' and iperf_pause_s | int > 0
+  pause:
+    seconds: "{{ iperf_pause_s }}"
+
+# K8S: Jobs für TCP und UDP sequentiell ausführen, Logs einsammeln, Job löschen
+- name: K8S Job TCP run
+  when: mode == 'k8s_internal'
+  k8s:
+    kubeconfig: "{{ kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: batch/v1
+      kind: Job
+      metadata:
+        name: "iperf3-client-tcp-{{ run }}"
+        namespace: default
+      spec:
+        template:
+          metadata:
+            labels:
+              app: iperf3-client
+              run: "tcp-{{ run }}"
+          spec:
+            restartPolicy: Never
+            containers:
+              - name: iperf3
+                image: networkstatic/iperf3
+                command: ["sh","-c"]
+                args:
+                  - >
+                    iperf3 -J -c iperf3-service -p 5201 -t {{ iperf_duration_s }} -i 1 | tee /out/tcp.json
+                volumeMounts:
+                  - name: out
+                    mountPath: /out
+            volumes:
+              - name: out
+                emptyDir: {}
+        backoffLimit: 0
+  delegate_to: "{{ k8s_manager_host }}"
+
+- name: K8S TCP fertig
+  when: mode == 'k8s_internal'
+  shell: |
+    set -euo pipefail
+    kubectl --kubeconfig={{ kubeconfig }} -n default wait --for=condition=complete --timeout=180s job/iperf3-client-tcp-{{ run }}
+  args: { executable: /bin/bash }
+  changed_when: false
+  delegate_to: "{{ k8s_manager_host }}"
+
+- name: Logs einsammeln TCP
+  when: mode == 'k8s_internal'
+  shell: |
+    set -euo pipefail
+    kubectl --kubeconfig={{ kubeconfig }} -n default logs job/iperf3-client-tcp-{{ run }}
+  register: klog_tcp
+  changed_when: false
+  delegate_to: "{{ k8s_manager_host }}"
+
+- name: TCP Job löschen
+  when: mode == 'k8s_internal'
+  shell: |
+    set -euo pipefail
+    kubectl --kubeconfig={{ kubeconfig }} -n default delete job/iperf3-client-tcp-{{ run }} --ignore-not-found
+  args: { executable: /bin/bash }
+  delegate_to: "{{ k8s_manager_host }}"
+
+- name: K8S Job UDP run
+  when: mode == 'k8s_internal'
+  k8s:
+    kubeconfig: "{{ kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: batch/v1
+      kind: Job
+      metadata:
+        name: "iperf3-client-udp-{{ run }}"
+        namespace: default
+      spec:
+        template:
+          metadata:
+            labels:
+              app: iperf3-client
+              run: "udp-{{ run }}"
+          spec:
+            restartPolicy: Never
+            containers:
+              - name: iperf3
+                image: networkstatic/iperf3
+                command: ["sh","-c"]
+                args:
+                  - >
+                    iperf3 -J -u -b 10M -c iperf3-service -p 5201 -t {{ iperf_duration_s }} -i 1 | tee /out/udp.json
+                volumeMounts:
+                  - name: out
+                    mountPath: /out
+            volumes:
+              - name: out
+                emptyDir: {}
+        backoffLimit: 0
+  delegate_to: "{{ k8s_manager_host }}"
+
+- name: K8S UDP fertig
+  when: mode == 'k8s_internal'
+  shell: |
+    set -euo pipefail
+    kubectl --kubeconfig={{ kubeconfig }} -n default wait --for=condition=complete --timeout=180s job/iperf3-client-udp-{{ run }}
+  args: { executable: /bin/bash }
+  changed_when: false
+  delegate_to: "{{ k8s_manager_host }}"
+
+- name: Logs einsammeln UDP
+  when: mode == 'k8s_internal'
+  shell: |
+    set -euo pipefail
+    kubectl --kubeconfig={{ kubeconfig }} -n default logs job/iperf3-client-udp-{{ run }}
+  register: klog_udp
+  changed_when: false
+  delegate_to: "{{ k8s_manager_host }}"
+
+- name: UDP Job löschen
+  when: mode == 'k8s_internal'
+  shell: |
+    set -euo pipefail
+    kubectl --kubeconfig={{ kubeconfig }} -n default delete job/iperf3-client-udp-{{ run }} --ignore-not-found
+  args: { executable: /bin/bash }
+  delegate_to: "{{ k8s_manager_host }}"
+
+# K8S: Valid-Flags setzen und Ergebnis ablegen
+- name: K8S Valid Flags setzen
+  when: mode == 'k8s_internal'
+  set_fact:
+    k8s_valid_tcp: "{{ (klog_tcp is defined) and (klog_tcp.stdout | default('') | trim | length > 0) and ('\"error\"' not in klog_tcp.stdout) }}"
+    k8s_valid_udp: "{{ (klog_udp is defined) and (klog_udp.stdout | default('') | trim | length > 0) and ('\"error\"' not in klog_udp.stdout) }}"
+
+- name: K8S Ergebnis speichern Controller nur valide
+  when: mode == 'k8s_internal' and (k8s_valid_tcp or k8s_valid_udp)
+  copy:
+    dest: "{{ k8s_dir }}/run{{ run }}.json"
+    mode: "0644"
+    content: |
+      {
+        "orchestrator":"k8s",
+        "run":{{ run }}{% if k8s_valid_tcp %},
+        "tcp": {{ klog_tcp.stdout }}{% endif %}{% if k8s_valid_udp %},
+        "udp": {{ klog_udp.stdout }}{% endif %}
+      }
+  delegate_to: localhost
+
+- name: Pause zwischen Laeufen K8s
+  when: mode == 'k8s_internal' and iperf_pause_s | int > 0
+  pause:
+    seconds: "{{ iperf_pause_s }}"
