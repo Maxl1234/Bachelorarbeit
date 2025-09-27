@@ -1,0 +1,448 @@
+# 1) Setup für beide Orchestratoren
+- name: "Setup: Parameter für {{ orch }}"
+  set_fact:
+    # Manager-Host je nach Orchestrator bestimmen
+    manager_host: >-
+      {{ (orch == 'swarm')
+         | ternary((groups.get('swarm_nodes', [])[0]),
+                   (groups.get('k8s_nodes', [])[0])) }}
+    # Ergebnisordner für diesen Orchestrator
+    result_path: "{{ base_result_dir }}/{{ orch }}"
+    # Pfad der App-Route mit Default-Fallback
+    _compute_path: "{{ compute_path | default('/compute') }}"
+
+- name: "Ergebnisse-Verzeichnis für {{ orch }} sicherstellen"
+  file:
+    path: "{{ result_path }}"
+    state: directory
+    mode: "0755"
+
+
+# 2) Swarm-spezifisch
+- name: "Swarm-Test: Monitoring & Compute-App deployen"
+  when: orch == 'swarm'
+  block:
+    # Image auf alle Swarm-Nodes kopieren und laden
+    - name: "Image-TAR auf Swarm-Nodes kopieren"
+      copy:
+        src: compute-app/images/compute-app-local.tar
+        dest: /tmp/compute-app-local.tar
+        mode: "0644"
+      loop: "{{ groups.get('swarm_nodes', []) }}"
+      loop_control: { loop_var: item }
+      delegate_to: "{{ item }}"
+      become: yes
+
+    - name: "Image in Docker laden (Swarm)"
+      community.docker.docker_image:
+        name: compute-app:local
+        source: load
+        load_path: /tmp/compute-app-local.tar
+        state: present
+      loop: "{{ groups.get('swarm_nodes', []) }}"
+      loop_control: { loop_var: item }
+      delegate_to: "{{ item }}"
+      become: yes
+
+    # Node-Exporter & cAdvisor (hostNetwork) für Metriken
+    - name: "Node Exporter (hostNetwork)"
+      community.docker.docker_container:
+        name: node-exporter
+        image: prom/node-exporter:latest
+        state: started
+        restart_policy: always
+        network_mode: host
+        pid_mode: host
+        command: ['--path.rootfs=/host']
+        volumes:
+          - '/:/host:ro,rslave'
+      loop: "{{ groups.get('swarm_nodes', []) }}"
+      loop_control: { loop_var: item }
+      delegate_to: "{{ item }}"
+      become: yes
+
+    - name: "cAdvisor (hostNetwork)"
+      community.docker.docker_container:
+        name: cadvisor
+        image: gcr.io/cadvisor/cadvisor:latest
+        state: started
+        restart_policy: always
+        network_mode: host
+        volumes:
+          - '/:/rootfs:ro'
+          - '/var/run:/var/run:rw'
+          - '/sys:/sys:ro'
+          - '/var/lib/docker/:/var/lib/docker:ro'
+      loop: "{{ groups.get('swarm_nodes', []) }}"
+      loop_control: { loop_var: item }
+      delegate_to: "{{ item }}"
+      become: yes
+
+    # Compute-App als Swarm-Service
+    - name: "Compute-App als Swarm-Service (3 Replicas, Port 80)"
+      community.docker.docker_swarm_service:
+        name: compute-app
+        image: compute-app:local
+        mode: replicated
+        replicas: 3
+        publish:
+          - published_port: 80
+            target_port: 80
+        reservations:
+          cpus: "0.20"
+          memory: "128M"
+        state: present
+      delegate_to: "{{ manager_host }}"
+      become: yes
+
+    # Auf 3 laufende Replicas warten
+    - name: "Warte auf 3 laufende Replicas"
+      shell: |
+        set -e
+        until [ "$(docker service ps compute-app --filter desired-state=running -q | wc -l)" -eq 3 ]; do
+          sleep 3
+        done
+      args: { executable: /bin/bash }
+      delegate_to: "{{ manager_host }}"
+      become: yes
+
+    # Smoke-Check via Manager-IP
+    - name: "Swarm Smoke: HTTP 200 auf /compute abwarten"
+      uri:
+        url: "http://{{ hostvars[manager_host].ansible_host | default(manager_host) }}:80{{ _compute_path }}"
+        method: GET
+        status_code: 200
+      register: swarm_http
+      retries: 40
+      delay: 3
+      until: swarm_http.status == 200
+      delegate_to: localhost
+
+    # wrk2 verfügbar machen und Runs durchführen
+    - name: "wrk2 auf Swarm-Manager bereitstellen"
+      copy:
+        src: /usr/local/bin/wrk2
+        dest: /usr/local/bin/wrk2
+        mode: "0755"
+      delegate_to: "{{ manager_host }}"
+      become: yes
+
+    - name: "SWARM Warmup ({{ warmup_duration }}s) lokal auf Manager"
+      shell: |
+        {{ wrk2_bin }} -t{{ wrk_threads }} -c{{ wrk_conns }} -d{{ warmup_duration }}s -R{{ warmup_rps }} \
+          "http://127.0.0.1:80{{ _compute_path }}" | tee /tmp/wrk2_warmup.txt
+      args: { executable: /bin/bash }
+      delegate_to: "{{ manager_host }}"
+      become: yes
+
+    - name: "SWARM Main ({{ main_duration }}s) lokal auf Manager"
+      shell: |
+        {{ wrk2_bin }} -t{{ wrk_threads }} -c{{ wrk_conns }} -d{{ main_duration }}s -R{{ main_rps }} \
+          "http://127.0.0.1:80{{ _compute_path }}" | tee /tmp/wrk2_main.txt
+      args: { executable: /bin/bash }
+      delegate_to: "{{ manager_host }}"
+      become: yes
+
+    # Logs einsammeln
+    - name: SWARM Warmup-Log holen
+      ansible.builtin.fetch:
+        src: /tmp/wrk2_warmup.txt
+        dest: "{{ result_path }}/"
+        flat: true
+      delegate_to: "{{ manager_host }}"
+
+    - name: SWARM Main-Log holen
+      ansible.builtin.fetch:
+        src: /tmp/wrk2_main.txt
+        dest: "{{ result_path }}/"
+        flat: true
+      delegate_to: "{{ manager_host }}"
+
+
+# 3) Kubernetes-spezifisch
+- name: "K8s-Test: Monitoring & Compute-App deployen"
+  when: orch == 'k8s'
+  block:
+    # Vorherige Artefakte kurz bereinigen (Deployment & Service)
+    - name: "Delete Deployment compute-app (falls vorhanden)"
+      k8s:
+        state: absent
+        kind: Deployment
+        name: compute-app
+        namespace: default
+        wait: true
+        wait_timeout: 180
+      environment: { KUBECONFIG: /home/ubuntu/.kube/config }
+      delegate_to: "{{ manager_host }}"
+      become: yes
+
+    - name: "Delete Service compute-service (falls vorhanden)"
+      k8s:
+        state: absent
+        kind: Service
+        name: compute-service
+        namespace: default
+      environment: { KUBECONFIG: /home/ubuntu/.kube/config }
+      delegate_to: "{{ manager_host }}"
+      become: yes
+
+    # Image in containerd importieren (alle K8s-Nodes)
+    - name: "Image-TAR auf K8s-Nodes kopieren"
+      copy:
+        src: compute-app/images/compute-app-local.tar
+        dest: /tmp/compute-app-local.tar
+        mode: "0644"
+      loop: "{{ groups.get('k8s_nodes', []) }}"
+      loop_control: { loop_var: item }
+      delegate_to: "{{ item }}"
+      become: yes
+
+    - name: "Image in containerd importieren"
+      shell: "ctr -n k8s.io image import /tmp/compute-app-local.tar"
+      args: { executable: /bin/bash }
+      loop: "{{ groups.get('k8s_nodes', []) }}"
+      loop_control: { loop_var: item }
+      delegate_to: "{{ item }}"
+      become: yes
+
+    # kubeconfig auf Manager bereitstellen
+    - name: ".kube Verzeichnis auf Manager"
+      file:
+        path: /home/ubuntu/.kube
+        state: directory
+        mode: "0755"
+      delegate_to: "{{ manager_host }}"
+      become: yes
+
+    - name: "admin.conf -> ~/.kube/config"
+      copy:
+        remote_src: yes
+        src: /etc/kubernetes/admin.conf
+        dest: /home/ubuntu/.kube/config
+        owner: ubuntu
+        group: ubuntu
+        mode: "0644"
+      delegate_to: "{{ manager_host }}"
+      become: yes
+
+    # Flannel vorhanden und ready?
+    - name: "Check: Flannel DaemonSet vorhanden?"
+      k8s_info:
+        api_version: apps/v1
+        kind: DaemonSet
+        name: kube-flannel-ds
+        namespace: kube-flannel
+      register: flannel_ds_info
+      delegate_to: "{{ manager_host }}"
+      become: yes
+      environment: { KUBECONFIG: /home/ubuntu/.kube/config }
+
+    - name: "Abbruch falls Flannel fehlt"
+      assert:
+        that: [ "flannel_ds_info.resources | length > 0" ]
+        fail_msg: "Flannel (kube-flannel-ds in kube-flannel) fehlt – bitte vorher installieren."
+      delegate_to: "{{ manager_host }}"
+
+    - name: "Warte bis Flannel Ready ist"
+      k8s_info:
+        api_version: apps/v1
+        kind: DaemonSet
+        name: kube-flannel-ds
+        namespace: kube-flannel
+      register: flannel_ds
+      until: flannel_ds.resources[0].status.numberReady
+             == flannel_ds.resources[0].status.desiredNumberScheduled
+      retries: 30
+      delay: 5
+      delegate_to: "{{ manager_host }}"
+      become: yes
+      environment: { KUBECONFIG: /home/ubuntu/.kube/config }
+
+    # Monitoring (Node Exporter)
+    - name: "Namespace monitoring"
+      k8s:
+        state: present
+        definition: |
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: monitoring
+      delegate_to: "{{ manager_host }}"
+      become: yes
+      environment: { KUBECONFIG: /home/ubuntu/.kube/config }
+
+    - name: "Node Exporter DaemonSet"
+      k8s:
+        state: present
+        definition: |
+          apiVersion: apps/v1
+          kind: DaemonSet
+          metadata:
+            name: node-exporter
+            namespace: monitoring
+          spec:
+            selector: { matchLabels: { app: node-exporter } }
+            template:
+              metadata: { labels: { app: node-exporter } }
+              spec:
+                hostNetwork: true
+                containers:
+                  - name: node-exporter
+                    image: prom/node-exporter:latest
+                    args: ["--path.rootfs=/host"]
+                    ports: [ { containerPort: 9100 } ]
+                    volumeMounts: [ { name: host, mountPath: /host } ]
+                volumes:
+                  - { name: host, hostPath: { path: / } }
+      delegate_to: "{{ manager_host }}"
+      become: yes
+      environment: { KUBECONFIG: /home/ubuntu/.kube/config }
+
+    # Compute-App (3 Replicas) + NodePort 30080
+    - name: "Deploy Compute-App Deployment"
+      k8s:
+        state: present
+        definition: |
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: compute-app
+            namespace: default
+          spec:
+            replicas: 3
+            selector: { matchLabels: { app: compute-app } }
+            template:
+              metadata: { labels: { app: compute-app } }
+              spec:
+                containers:
+                  - name: compute
+                    image: compute-app:local
+                    imagePullPolicy: IfNotPresent
+                    ports: [ { containerPort: 80 } ]
+                    readinessProbe:
+                      httpGet: { path: "/compute", port: 80 }
+                      initialDelaySeconds: 10
+                      periodSeconds: 5
+                      timeoutSeconds: 5
+                      failureThreshold: 6
+                    resources:
+                      requests:
+                        cpu: "200m"
+                        memory: "128Mi"
+      delegate_to: "{{ manager_host }}"
+      become: yes
+      environment: { KUBECONFIG: /home/ubuntu/.kube/config }
+
+    - name: "Expose Compute-Service (NodePort 30080)"
+      k8s:
+        state: present
+        definition: |
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: compute-service
+            namespace: default
+          spec:
+            type: NodePort
+            selector: { app: compute-app }
+            ports:
+              - port: 80
+                targetPort: 80
+                nodePort: 30080
+      delegate_to: "{{ manager_host }}"
+      become: yes
+      environment: { KUBECONFIG: /home/ubuntu/.kube/config }
+
+    # a) Warten bis Service Endpoints hat
+    - name: "Wait for service endpoints"
+      k8s_info:
+        api_version: v1
+        kind: Endpoints
+        name: compute-service
+        namespace: default
+      register: eps
+      until: >
+        (eps.resources | length) > 0 and
+        (
+          (eps.resources[0].subsets | default([]))
+          | selectattr('addresses','defined') | list | length
+        ) > 0
+      retries: 30
+      delay: 5
+      environment: { KUBECONFIG: /home/ubuntu/.kube/config }
+      delegate_to: "{{ manager_host }}"
+      become: yes
+
+    # b) NodePort akzeptiert TCP?
+    - name: "Wait for NodePort to accept TCP"
+      wait_for:
+        host: "127.0.0.1"
+        port: 30080
+        timeout: 120
+      delegate_to: "{{ manager_host }}"
+      become: yes
+
+    # c) Kleiner Smoke-Test (HTTP 200)
+    - name: "Smoke request to /compute"
+      uri:
+        url: "http://127.0.0.1:30080{{ _compute_path }}"
+        method: GET
+        status_code: 200
+      register: smoke
+      retries: 10
+      delay: 3
+      until: smoke.status == 200
+      delegate_to: "{{ manager_host }}"
+      become: yes
+
+    # d) Rollout abwarten (Optional, aber nützlich für Stabilität)
+    - name: "Warte auf Compute-App Rollout (bereit)"
+      k8s:
+        state: present
+        kind: Deployment
+        name: compute-app
+        namespace: default
+        wait: yes
+        wait_timeout: 300
+      delegate_to: "{{ manager_host }}"
+      become: yes
+      environment: { KUBECONFIG: /home/ubuntu/.kube/config }
+
+    # wrk2 bereitstellen & Lastfahrt
+    - name: "wrk2 auf K8s-Manager bereitstellen"
+      copy:
+        src: /usr/local/bin/wrk2
+        dest: /usr/local/bin/wrk2
+        mode: "0755"
+      delegate_to: "{{ manager_host }}"
+      become: yes
+
+    - name: "K8S Warmup ({{ warmup_duration }}s) lokal auf Manager"
+      shell: |
+        {{ wrk2_bin }} -t{{ wrk_threads }} -c{{ wrk_conns }} -d{{ warmup_duration }}s -R{{ warmup_rps }} \
+          "http://127.0.0.1:30080{{ _compute_path }}" | tee /tmp/k8s_wrk2_warmup.txt
+      args: { executable: /bin/bash }
+      delegate_to: "{{ manager_host }}"
+      become: yes
+
+    - name: K8S Warmup-Log holen
+      ansible.builtin.fetch:
+        src: /tmp/k8s_wrk2_warmup.txt
+        dest: "{{ result_path }}/"
+        flat: true
+      delegate_to: "{{ manager_host }}"
+
+    - name: "K8S Main ({{ main_duration }}s) lokal auf Manager"
+      shell: |
+        {{ wrk2_bin }} -t{{ wrk_threads }} -c{{ wrk_conns }} -d{{ main_duration }}s -R{{ main_rps }} \
+          "http://127.0.0.1:30080{{ _compute_path }}" | tee /tmp/k8s_wrk2_main.txt
+      args: { executable: /bin/bash }
+      delegate_to: "{{ manager_host }}"
+      become: yes
+
+    - name: K8S Main-Log holen
+      ansible.builtin.fetch:
+        src: /tmp/k8s_wrk2_main.txt
+        dest: "{{ result_path }}/"
+        flat: true
+      delegate_to: "{{ manager_host }}"
